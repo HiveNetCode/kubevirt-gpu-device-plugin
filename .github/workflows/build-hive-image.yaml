@@ -51,7 +51,7 @@ jobs:
 
       - name: Build distroless image
         run: |
-          make -C deployments/container build-distroless \
+          make -f deployments/container/Makefile build-distroless \
             IMAGE_NAME="${DOCKER_IMAGE}" \
             VERSION="${IMAGE_TAG}"
 
