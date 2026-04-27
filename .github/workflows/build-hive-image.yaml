@@ -12,11 +12,6 @@ on:
           - dev
           - staging
           - production
-  push:
-    branches:
-      - master
-      - 'fix/**'
-      - 'feat/**'
 
 env:
   DOCKER_IMAGE: ${{ vars.DOCKER_REGISTRY }}/hive-compute-infra/kubevirt-gpu-device-plugin
