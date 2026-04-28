@@ -91,6 +91,9 @@ func InitiateDevicePlugin() {
 	createIommuDeviceMap()
 	//Identifies vGPUs and represents it in appropriate structures
 	createVgpuIDMap()
+	//Watch for NVIDIA GPUs bound to a VFIO driver after initial discovery,
+	//and trigger a process exit so the daemonset re-runs discovery on restart.
+	go watchVfioBindings(stop)
 	//Creates and starts device plugin
 	createDevicePlugins()
 }

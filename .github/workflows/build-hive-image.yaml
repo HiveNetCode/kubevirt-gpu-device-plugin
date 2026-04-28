@@ -1,0 +1,63 @@
+name: Build Hive Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Target environment for image tag'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  DOCKER_IMAGE: ${{ vars.DOCKER_REGISTRY }}/hive-compute-infra/kubevirt-gpu-device-plugin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.env_name || 'dev' }}
+    name: Build kubevirt-gpu-device-plugin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get timestamp
+        run: echo "TIMESTAMP=$(date +"%Y%m%d%H%M%S")" >> $GITHUB_ENV
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          ENV_NAME="${{ github.event.inputs.env_name || 'dev' }}"
+          UPSTREAM_VERSION=$(awk -F'= ' '/^VERSION/ {print $2}' versions.mk | tr -d ' ')
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          IMAGE_TAG="${ENV_NAME}-${UPSTREAM_VERSION}-hive-${SHORT_SHA}-${TIMESTAMP}"
+          LATEST_TAG="${ENV_NAME}-latest"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "LATEST_TAG=${LATEST_TAG}" >> $GITHUB_ENV
+          echo "Computed image tag: ${IMAGE_TAG}"
+
+      - name: Install Crane
+        uses: imjasonh/setup-crane@v0.5
+
+      - name: Login to OVH Registry
+        run: |
+          echo '${{ secrets.DOCKER_PASSWORD }}' | docker login ${{ vars.DOCKER_REGISTRY }} -u '${{ vars.DOCKER_USERNAME }}' --password-stdin
+
+      - name: Build distroless image
+        run: |
+          make -f deployments/container/Makefile build-distroless \
+            IMAGE_NAME="${DOCKER_IMAGE}" \
+            VERSION="${IMAGE_TAG}"
+
+      - name: Push image
+        run: |
+          docker push "${DOCKER_IMAGE}:${IMAGE_TAG}"
+          crane tag "${DOCKER_IMAGE}:${IMAGE_TAG}" "${LATEST_TAG}"
+          echo "Pushed ${DOCKER_IMAGE}:${IMAGE_TAG}"
+          echo "Tagged as ${DOCKER_IMAGE}:${LATEST_TAG}"
