@@ -53,35 +53,26 @@ var nvidiaVfioBdfs = nvidiaVfioBdfsFunc
 // rejects sysfs control entries like "bind", "unbind", "new_id", "module".
 var pciAddressRe = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`)
 
-// onNewVfioBdf is the watcher's callback for each new NVIDIA PCI device
-// bound to a supported VFIO driver. Overridable for tests. Default:
-// onLateVfioBinding in device_plugin.go, which registers the BDF in the
-// in-memory maps and pushes the device into the live ListAndWatch stream of
-// the matching plugin.
-var onNewVfioBdf = func(bdf string) {
-	onLateVfioBinding(bdf)
-}
-
-// watchVfioBindings detects NVIDIA GPUs bound to a supported VFIO driver
-// after this process completed its initial discovery and incrementally
-// registers each one via onNewVfioBdf — no process restart, so kubelet's
-// device-manager checkpoint and the existing tenant pod allocations are
-// never invalidated.
+// watchVfioBindings reports every NVIDIA PCI device that becomes bound to a
+// supported VFIO driver after the initial discovery, by invoking onBound for
+// each new BDF. It does not exit the process — the plugin keeps running and
+// the caller is expected to publish the new device through its live
+// ListAndWatch stream.
 //
-// Earlier versions closed stop on the first new binding to trigger a
-// container restart. That worked for the original symptom (advertise GPUs
-// bound after startup) but introduced a subtler bug on multi-tenant GPU
-// nodes: kubelet had to reconcile its pre-restart device set against the
-// post-restart ListAndWatch frames, and during that window in-flight pod
-// allocations to busy GPUs could be either dropped or double-handed-out —
-// qemu then failed to open /dev/vfio/<group> with EBUSY. Live incremental
-// updates avoid the whole reconciliation window.
+// Earlier versions of this watcher closed a stop channel on the first new
+// binding to trigger a container restart. That worked for the original
+// symptom but introduced a subtler bug on multi-tenant GPU nodes: kubelet
+// had to reconcile its pre-restart device set against the post-restart
+// ListAndWatch frames, and during that window in-flight pod allocations
+// could be dropped or double-handed-out — qemu then failed to open
+// /dev/vfio/<group> with EBUSY. Live incremental updates avoid the whole
+// reconciliation window.
 //
-// The watcher still captures a baseline of currently-bound NVIDIA BDFs
-// before adding the fsnotify watch and re-scans immediately after Add to
-// close the race window between baseline capture and watcher activation.
-// Each new BDF is dispatched exactly once via the baseline set.
-func watchVfioBindings(stop chan struct{}) {
+// The watcher captures a baseline of currently-bound NVIDIA BDFs before
+// adding the fsnotify watch and re-scans immediately after Add to close the
+// race between baseline capture and watcher activation. Each new BDF is
+// dispatched exactly once via the baseline set.
+func watchVfioBindings(stop <-chan struct{}, onBound func(bdf string)) {
 	const method = "vfio-watcher"
 
 	watcher, err := fsnotify.NewWatcher()
@@ -105,7 +96,7 @@ func watchVfioBindings(stop chan struct{}) {
 	if extra := newNvidiaBdfs(baseline); len(extra) > 0 {
 		log.Printf("%s: post-baseline rescan found new NVIDIA GPU(s): %s", method, joinSorted(extra))
 		for _, bdf := range extra {
-			onNewVfioBdf(bdf)
+			onBound(bdf)
 			baseline[bdf] = struct{}{}
 		}
 	}
@@ -122,8 +113,8 @@ func watchVfioBindings(stop chan struct{}) {
 				continue
 			}
 			bdf := filepath.Base(ev.Name)
-			log.Printf("%s: new NVIDIA GPU %s bound to a VFIO driver — registering live", method, bdf)
-			onNewVfioBdf(bdf)
+			log.Printf("%s: new NVIDIA GPU %s bound to a VFIO driver", method, bdf)
+			onBound(bdf)
 			baseline[bdf] = struct{}{}
 		case err, ok := <-watcher.Errors:
 			if !ok {

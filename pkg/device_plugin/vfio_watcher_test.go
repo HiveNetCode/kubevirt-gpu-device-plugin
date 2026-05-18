@@ -184,14 +184,18 @@ var _ = Describe("vfio-watcher", func() {
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return nvidiaVendorID, nil }
 
-			origCb := onNewVfioBdf
-			defer func() { onNewVfioBdf = origCb }()
 			seen := make(chan string, 4)
-			onNewVfioBdf = func(bdf string) { seen <- bdf }
-
 			stop := make(chan struct{})
-			defer close(stop)
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 
 			// Give the watcher a moment to set up its fsnotify Add.
 			time.Sleep(150 * time.Millisecond)
@@ -216,14 +220,18 @@ var _ = Describe("vfio-watcher", func() {
 				return map[string]struct{}{"0000:01:00.0": {}}
 			}
 
-			origCb := onNewVfioBdf
-			defer func() { onNewVfioBdf = origCb }()
 			seen := make(chan string, 4)
-			onNewVfioBdf = func(bdf string) { seen <- bdf }
-
 			stop := make(chan struct{})
-			defer close(stop)
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 
 			Eventually(seen, "2s").Should(Receive(Equal("0000:01:00.0")),
 				"watcher must call onNewVfioBdf for BDFs that bound during the baseline-to-Add race window")
@@ -233,14 +241,18 @@ var _ = Describe("vfio-watcher", func() {
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return nvidiaVendorID, nil }
 
-			origCb := onNewVfioBdf
-			defer func() { onNewVfioBdf = origCb }()
 			seen := make(chan string, 4)
-			onNewVfioBdf = func(bdf string) { seen <- bdf }
-
 			stop := make(chan struct{})
-			defer close(stop)
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 			time.Sleep(150 * time.Millisecond)
 
 			Expect(os.WriteFile(filepath.Join(tmpDir, "vfio-pci", "bind"), nil, 0o644)).To(Succeed())
@@ -252,14 +264,18 @@ var _ = Describe("vfio-watcher", func() {
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return "8086", nil }
 
-			origCb := onNewVfioBdf
-			defer func() { onNewVfioBdf = origCb }()
 			seen := make(chan string, 4)
-			onNewVfioBdf = func(bdf string) { seen <- bdf }
-
 			stop := make(chan struct{})
-			defer close(stop)
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 			time.Sleep(150 * time.Millisecond)
 
 			Expect(os.WriteFile(filepath.Join(tmpDir, "vfio-pci", "0000:01:00.0"), nil, 0o644)).To(Succeed())
@@ -274,7 +290,7 @@ var _ = Describe("vfio-watcher", func() {
 			stop := make(chan struct{})
 			done := make(chan struct{})
 			go func() {
-				watchVfioBindings(stop)
+				watchVfioBindings(stop, func(string) {})
 				close(done)
 			}()
 
