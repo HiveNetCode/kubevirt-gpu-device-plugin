@@ -34,6 +34,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 var _ = Describe("vfio-busy", func() {
@@ -72,96 +74,72 @@ var _ = Describe("vfio-busy", func() {
 		})
 	})
 
-	Describe("createIommuDeviceMap with busy-group filter", func() {
+	Describe("createDevicePlugins marks busy-group GPUs Unhealthy", func() {
 		var (
-			workDir          string
-			origReadLink     func(string, string, string) (string, error)
-			origReadID       func(string, string, string) (string, error)
-			origIsBusy       func(string) bool
-			origBasePath     string
-			origDeviceMap    map[string][]NvidiaGpuDevice
-			origIommuMap     map[string][]NvidiaGpuDevice
-			origBdfToIommu   map[string]string
+			origIsBusy     func(string) bool
+			origDeviceMap  map[string][]NvidiaGpuDevice
+			origBdfToIommu map[string]string
+			origStart      func(*GenericDevicePlugin) error
+			started        []*GenericDevicePlugin
 		)
 
 		BeforeEach(func() {
-			var err error
-			workDir, err = os.MkdirTemp("", "vfio-busy-discovery")
-			Expect(err).ToNot(HaveOccurred())
-			linkDir, err := os.MkdirTemp("", "vfio-busy-targets")
-			Expect(err).ToNot(HaveOccurred())
+			origDeviceMap = deviceMap
+			origBdfToIommu = bdfToIommuMap
 
-			// createIommuDeviceMap uses filepath.Walk's Lstat, so directories
-			// are skipped. Mirror the existing test pattern: a symlink at
-			// workDir/<BDF> pointing at a real directory under linkDir lets
-			// info.IsDir() return false for the entry while still being a
-			// valid sysfs-like path.
-			for _, bdf := range []string{"0000:23:00.0", "0000:24:00.0"} {
-				target := filepath.Join(linkDir, bdf)
-				Expect(os.Mkdir(target, 0755)).To(Succeed())
-				Expect(os.Symlink(target, filepath.Join(workDir, bdf))).To(Succeed())
+			// Two NVIDIA GPUs of the same device id sharing a single plugin:
+			// 0000:23:00.0 → group 51 (busy, held by another tenant VM)
+			// 0000:24:00.0 → group 73 (free)
+			deviceMap = map[string][]NvidiaGpuDevice{
+				"2684": {
+					{addr: "0000:23:00.0", numaNode: 0},
+					{addr: "0000:24:00.0", numaNode: 0},
+				},
 			}
-
-			origBasePath = basePath
-			basePath = workDir
-
-			origReadLink = readLink
-			readLink = func(_, addr, link string) (string, error) {
-				switch link {
-				case "driver":
-					return "vfio-pci", nil
-				case "iommu_group":
-					if addr == "0000:23:00.0" {
-						return "51", nil
-					}
-					return "73", nil
-				}
-				return "", nil
-			}
-
-			origReadID = readIDFromFile
-			readIDFromFile = func(_, _, prop string) (string, error) {
-				switch prop {
-				case "vendor":
-					return nvidiaVendorID, nil
-				case "device":
-					return "2684", nil
-				}
-				return "", nil
+			bdfToIommuMap = map[string]string{
+				"0000:23:00.0": "51",
+				"0000:24:00.0": "73",
 			}
 
 			origIsBusy = isVfioGroupBusy
-			isVfioGroupBusy = func(group string) bool {
-				// 0000:23:00.0 (group 51) is held by another tenant VM.
-				return group == "51"
-			}
+			isVfioGroupBusy = func(group string) bool { return group == "51" }
 
-			origDeviceMap = deviceMap
-			origIommuMap = iommuMap
-			origBdfToIommu = bdfToIommuMap
+			origStart = startDevicePlugin
+			started = nil
+			startDevicePlugin = func(dp *GenericDevicePlugin) error {
+				started = append(started, dp)
+				return nil
+			}
 		})
 
 		AfterEach(func() {
-			basePath = origBasePath
-			readLink = origReadLink
-			readIDFromFile = origReadID
-			isVfioGroupBusy = origIsBusy
 			deviceMap = origDeviceMap
-			iommuMap = origIommuMap
 			bdfToIommuMap = origBdfToIommu
-			os.RemoveAll(workDir)
+			isVfioGroupBusy = origIsBusy
+			startDevicePlugin = origStart
 		})
 
-		It("skips devices whose vfio group is held by another process", func() {
-			createIommuDeviceMap()
+		It("keeps busy GPUs in the pool but marks them Unhealthy", func() {
+			// createDevicePlugins blocks on the package stop channel after
+			// constructing the plugins. Run it in a goroutine, give it a
+			// moment to populate `started`, then unblock it.
+			go createDevicePlugins()
+			Eventually(func() int { return len(started) }, "2s", "20ms").
+				Should(Equal(1), "a single plugin is created per device id (here 2684)")
+			stop <- struct{}{}
 
-			Expect(bdfToIommuMap).NotTo(HaveKey("0000:23:00.0"),
-				"a device whose vfio group is held must not be advertised — otherwise kubelet hands the PCI ID to a new pod and qemu fails with /dev/vfio/<group> EBUSY")
-			Expect(iommuMap).NotTo(HaveKey("51"))
+			devsByID := map[string]string{}
+			for _, d := range started[0].devs {
+				devsByID[d.ID] = d.Health
+			}
 
-			Expect(bdfToIommuMap).To(HaveKeyWithValue("0000:24:00.0", "73"),
-				"a device whose vfio group is free must still be discovered")
-			Expect(iommuMap).To(HaveKey("73"))
+			Expect(devsByID).To(HaveKey("0000:23:00.0"),
+				"a busy GPU must stay in the advertised pool so kubelet's capacity accounting is correct and the existing-pod allocation is preserved")
+			Expect(devsByID["0000:23:00.0"]).To(Equal(pluginapi.Unhealthy),
+				"a busy GPU must be Unhealthy so kubelet does not hand the same PCI ID to a new pod — which would crashloop in qemu with /dev/vfio/<group> EBUSY")
+
+			Expect(devsByID).To(HaveKeyWithValue("0000:24:00.0", pluginapi.Healthy),
+				"a free GPU must remain Healthy and available for allocation")
 		})
 	})
 })
