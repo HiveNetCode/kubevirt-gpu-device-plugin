@@ -226,6 +226,17 @@ func createIommuDeviceMap() {
 				log.Println("Could not get IOMMU Group for device ", info.Name())
 				return nil
 			}
+			// Skip devices whose /dev/vfio/<group> is already held by
+			// another process — typically a running tenant VM that has
+			// this GPU passed through. Advertising them as free causes
+			// kubelet to hand the PCI ID to a new pod, whose qemu then
+			// fails with "Could not open '/dev/vfio/<group>': Device or
+			// resource busy". They are re-evaluated by healthCheck and
+			// re-added once the holder releases the group.
+			if isVfioGroupBusy(iommuGroup) {
+				log.Printf("Skipping %s: /dev/vfio/%s is held by another process (already in use)", info.Name(), iommuGroup)
+				return nil
+			}
 			numaNode, err := readNUMANode(basePath, info.Name())
 			if err != nil {
 				log.Printf("Could not get NUMA node for device %s: %v. Defaulting to NUMA node 0", info.Name(), err)
