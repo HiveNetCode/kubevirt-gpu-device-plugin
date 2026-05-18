@@ -37,6 +37,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	klog "k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
@@ -52,6 +53,11 @@ type NvidiaGpuDevice struct {
 	numaNode int64  // NUMA node ID
 }
 
+// mapsMu guards iommuMap, deviceMap, and bdfToIommuMap so that incremental
+// additions from the vfio-watcher (after the initial discovery walk) do not
+// race with reads from the device-plugin's Allocate() / health-check loops.
+var mapsMu sync.RWMutex
+
 // Key is iommu group id and value is a list of gpu devices part of the iommu group
 var iommuMap map[string][]NvidiaGpuDevice
 
@@ -60,6 +66,15 @@ var deviceMap map[string][]NvidiaGpuDevice
 
 // Maps PCI BDF to iommu group ids
 var bdfToIommuMap map[string]string
+
+// pluginRegistry maps a kubelet device-id (e.g. "2684" for an RTX 4090) to
+// the live GenericDevicePlugin advertising it, so the vfio-watcher can push
+// newly-bound GPUs into the right plugin's ListAndWatch stream without
+// restarting the process. Guarded by pluginRegistryMu.
+var (
+	pluginRegistryMu sync.Mutex
+	pluginRegistry   = map[string]*GenericDevicePlugin{}
+)
 
 // Key is vGPU Type and value is the list of Nvidia vGPUs of that type
 var vGpuMap map[string][]NvidiaGpuDevice
@@ -103,13 +118,23 @@ func createDevicePlugins() {
 	var devicePlugins []*GenericDevicePlugin
 	var vGpuDevicePlugins []*GenericVGpuDevicePlugin
 	var devs []*pluginapi.Device
+	// Snapshot deviceMap under the read lock so concurrent additions from
+	// the vfio-watcher do not race with this initial iteration.
+	mapsMu.RLock()
+	deviceMapSnapshot := make(map[string][]NvidiaGpuDevice, len(deviceMap))
+	for k, v := range deviceMap {
+		cp := make([]NvidiaGpuDevice, len(v))
+		copy(cp, v)
+		deviceMapSnapshot[k] = cp
+	}
 	log.Printf("Iommu Map %v", iommuMap)
 	log.Printf("Device Map %v", deviceMap)
+	mapsMu.RUnlock()
 	log.Println("vGPU Map ", vGpuMap)
 	log.Println("GPU vGPU Map ", gpuVgpuMap)
 
 	//Iterate over deivceMap to create device plugin for each type of GPU on the host
-	for k, gpuDevices := range deviceMap {
+	for k, gpuDevices := range deviceMapSnapshot {
 		devs = nil
 		for _, gpuDev := range gpuDevices {
 			device := &pluginapi.Device{
@@ -131,6 +156,9 @@ func createDevicePlugins() {
 		}
 		log.Printf("DP Name %s", deviceName)
 		dp := NewGenericDevicePlugin(deviceName, "/dev/vfio/", devs)
+		// Register before Start so the vfio-watcher callback can already
+		// reach this plugin if a late binding arrives during startup.
+		registerPlugin(k, dp)
 		err := startDevicePlugin(dp)
 		if err != nil {
 			log.Printf("Error starting %s device plugin: %v", dp.deviceName, err)
@@ -188,9 +216,11 @@ func startVgpuDevicePluginFunc(dp *GenericVGpuDevicePlugin) error {
 
 // Discovers all Nvidia GPUs which are loaded with VFIO-PCI driver and creates corresponding maps
 func createIommuDeviceMap() {
+	mapsMu.Lock()
 	iommuMap = make(map[string][]NvidiaGpuDevice)
 	deviceMap = make(map[string][]NvidiaGpuDevice)
 	bdfToIommuMap = make(map[string]string)
+	mapsMu.Unlock()
 	//Walk directory to discover pci devices
 	filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -201,51 +231,98 @@ func createIommuDeviceMap() {
 			log.Println("Not a device, continuing")
 			return nil
 		}
-		//Retrieve vendor for the device
-		vendorID, err := readIDFromFile(basePath, info.Name(), "vendor")
-		if err != nil {
-			log.Println("Could not get vendor ID for device ", info.Name())
-			return nil
-		}
-
-		//Nvidia vendor id is "10de". Proceed if vendor id is 10de
-		if vendorID == nvidiaVendorID {
-			log.Println("Nvidia device ", info.Name())
-			//Retrieve iommu group for the device
-			driver, err := readLink(basePath, info.Name(), "driver")
-			if err != nil {
-				log.Println("Could not get driver for device ", info.Name())
-				return nil
-			}
-			if !isSupportedVfioDriver(driver) {
-				log.Printf("Skipping %s: driver %s is not a supported VFIO driver", info.Name(), driver)
-				return nil
-			}
-			iommuGroup, err := readLink(basePath, info.Name(), "iommu_group")
-			if err != nil {
-				log.Println("Could not get IOMMU Group for device ", info.Name())
-				return nil
-			}
-			numaNode, err := readNUMANode(basePath, info.Name())
-			if err != nil {
-				log.Printf("Could not get NUMA node for device %s: %v. Defaulting to NUMA node 0", info.Name(), err)
-				numaNode = 0
-			}
-			log.Println("Iommu Group " + iommuGroup)
-			// Always record this PCI device (BDF) under its device ID so we
-			// advertise actual PCI BDFs to kubelet and provide NUMA topology.
-			deviceID, err := readIDFromFile(basePath, info.Name(), "device")
-			if err != nil {
-				log.Println("Could get deviceID for PCI address ", info.Name())
-				return nil
-			}
-			log.Printf("Device Id %s", deviceID)
-			deviceMap[deviceID] = append(deviceMap[deviceID], NvidiaGpuDevice{addr: info.Name(), numaNode: numaNode})
-			gpuDevice := NvidiaGpuDevice{addr: info.Name(), numaNode: numaNode}
-			iommuMap[iommuGroup] = append(iommuMap[iommuGroup], gpuDevice)
-			bdfToIommuMap[info.Name()] = iommuGroup
-		}
+		registerVfioBdf(info.Name())
 		return nil
+	})
+}
+
+// registerVfioBdf inspects a single PCI BDF in sysfs and, if it is an NVIDIA
+// GPU bound to a supported VFIO driver and not already known, adds it to
+// iommuMap / deviceMap / bdfToIommuMap. Returns the device id and the new
+// gpu-device entry along with whether anything was added.
+//
+// Used both during the initial walk and on every late vfio-pci binding the
+// watcher detects, so the in-memory pool grows incrementally without ever
+// restarting the plugin process — which is what previously caused the
+// kubelet device-manager accounting drift on multi-tenant GPU nodes.
+func registerVfioBdf(bdf string) (deviceID string, gpuDevice NvidiaGpuDevice, added bool) {
+	vendorID, err := readIDFromFile(basePath, bdf, "vendor")
+	if err != nil || vendorID != nvidiaVendorID {
+		return "", NvidiaGpuDevice{}, false
+	}
+	driver, err := readLink(basePath, bdf, "driver")
+	if err != nil {
+		log.Printf("registerVfioBdf %s: could not get driver: %v", bdf, err)
+		return "", NvidiaGpuDevice{}, false
+	}
+	if !isSupportedVfioDriver(driver) {
+		return "", NvidiaGpuDevice{}, false
+	}
+	iommuGroup, err := readLink(basePath, bdf, "iommu_group")
+	if err != nil {
+		log.Printf("registerVfioBdf %s: could not get iommu_group: %v", bdf, err)
+		return "", NvidiaGpuDevice{}, false
+	}
+	numaNode, err := readNUMANode(basePath, bdf)
+	if err != nil {
+		log.Printf("registerVfioBdf %s: could not get NUMA node: %v. Defaulting to 0", bdf, err)
+		numaNode = 0
+	}
+	deviceID, err = readIDFromFile(basePath, bdf, "device")
+	if err != nil {
+		log.Printf("registerVfioBdf %s: could not get deviceID: %v", bdf, err)
+		return "", NvidiaGpuDevice{}, false
+	}
+	gpuDevice = NvidiaGpuDevice{addr: bdf, numaNode: numaNode}
+
+	mapsMu.Lock()
+	if _, exists := bdfToIommuMap[bdf]; exists {
+		mapsMu.Unlock()
+		return deviceID, gpuDevice, false
+	}
+	deviceMap[deviceID] = append(deviceMap[deviceID], gpuDevice)
+	iommuMap[iommuGroup] = append(iommuMap[iommuGroup], gpuDevice)
+	bdfToIommuMap[bdf] = iommuGroup
+	mapsMu.Unlock()
+
+	log.Printf("registerVfioBdf %s: added (device=%s, iommu_group=%s, numa=%d)", bdf, deviceID, iommuGroup, numaNode)
+	return deviceID, gpuDevice, true
+}
+
+// registerPlugin associates a deviceID with the live GenericDevicePlugin
+// advertising it, so onLateVfioBinding can push new BDFs into the right
+// plugin's ListAndWatch stream.
+func registerPlugin(deviceID string, dp *GenericDevicePlugin) {
+	pluginRegistryMu.Lock()
+	defer pluginRegistryMu.Unlock()
+	pluginRegistry[deviceID] = dp
+}
+
+// onLateVfioBinding is the watcher callback. It registers the BDF in the
+// shared maps and, if a plugin for this device id is already running, pushes
+// the new device into its ListAndWatch stream so kubelet sees it without any
+// process restart. For a never-before-seen device id (e.g. a freshly-hot-
+// plugged GPU model that no other GPU on the node matches), the device is
+// recorded in the maps and will be advertised the next time the daemonset
+// restarts for an unrelated reason.
+func onLateVfioBinding(bdf string) {
+	deviceID, gpuDev, added := registerVfioBdf(bdf)
+	if !added {
+		return
+	}
+	pluginRegistryMu.Lock()
+	dp, ok := pluginRegistry[deviceID]
+	pluginRegistryMu.Unlock()
+	if !ok {
+		log.Printf("onLateVfioBinding: no live plugin for device id %s yet; new GPU %s will appear after next daemon restart", deviceID, bdf)
+		return
+	}
+	dp.AddDevice(&pluginapi.Device{
+		ID:     gpuDev.addr,
+		Health: pluginapi.Healthy,
+		Topology: &pluginapi.TopologyInfo{
+			Nodes: []*pluginapi.NUMANode{{ID: gpuDev.numaNode}},
+		},
 	})
 }
 
@@ -359,12 +436,31 @@ func readGpuIDForVgpuFunc(basePath string, deviceAddress string) (string, error)
 
 }
 
+// getIommuMap returns a snapshot copy of iommuMap taken under the maps
+// read lock, so callers can iterate without racing concurrent additions
+// from the vfio-watcher's onLateVfioBinding path.
 func getIommuMap() map[string][]NvidiaGpuDevice {
-	return iommuMap
+	mapsMu.RLock()
+	defer mapsMu.RUnlock()
+	out := make(map[string][]NvidiaGpuDevice, len(iommuMap))
+	for k, v := range iommuMap {
+		cp := make([]NvidiaGpuDevice, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
 }
 
+// getBdfToIommuMap returns a snapshot copy of bdfToIommuMap taken under
+// the maps read lock.
 func getBdfToIommuMap() map[string]string {
-	return bdfToIommuMap
+	mapsMu.RLock()
+	defer mapsMu.RUnlock()
+	out := make(map[string]string, len(bdfToIommuMap))
+	for k, v := range bdfToIommuMap {
+		out[k] = v
+	}
+	return out
 }
 
 func getGpuVgpuMap() map[string][]string {
