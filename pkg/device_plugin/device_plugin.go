@@ -137,9 +137,21 @@ func createDevicePlugins() {
 	for k, gpuDevices := range deviceMapSnapshot {
 		devs = nil
 		for _, gpuDev := range gpuDevices {
+			// Mark devices whose /dev/vfio/<group> is currently held by
+			// another process as Unhealthy. Including them in the pool
+			// preserves the kubelet's capacity accounting and the existing
+			// allocations of running pods that already hold them; the
+			// Unhealthy flag keeps the kubelet from handing the same PCI
+			// ID to a new pod, which would otherwise fail with
+			// "Could not open '/dev/vfio/<group>': Device or resource busy".
+			health := pluginapi.Healthy
+			if iommuGroup, ok := bdfToIommuMap[gpuDev.addr]; ok && isVfioGroupBusy(iommuGroup) {
+				health = pluginapi.Unhealthy
+				log.Printf("Marking %s Unhealthy: /dev/vfio/%s is held by another process (already in use)", gpuDev.addr, iommuGroup)
+			}
 			device := &pluginapi.Device{
 				ID:     gpuDev.addr,
-				Health: pluginapi.Healthy,
+				Health: health,
 				Topology: &pluginapi.TopologyInfo{
 					Nodes: []*pluginapi.NUMANode{
 						{ID: gpuDev.numaNode},
