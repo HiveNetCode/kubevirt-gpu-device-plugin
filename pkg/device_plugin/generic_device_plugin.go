@@ -40,6 +40,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -71,6 +72,8 @@ var discoverEGMDevices = discoverEGMDevicesFunc
 // Implements the kubernetes device plugin API
 type GenericDevicePlugin struct {
 	devs       []*pluginapi.Device
+	devsMu     sync.RWMutex // guards devs against concurrent AddDevice + ListAndWatch + health updates
+	update     chan struct{}
 	server     *grpc.Server
 	socketPath string
 	stop       chan struct{} // this channel signals to stop the DP
@@ -87,6 +90,7 @@ func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*plu
 	serverSock := fmt.Sprintf(pluginapi.DevicePluginPath+"kubevirt-%s.sock", deviceName)
 	dpi := &GenericDevicePlugin{
 		devs:       devices,
+		update:     make(chan struct{}, 1),
 		socketPath: serverSock,
 		term:       make(chan bool, 1),
 		healthy:    make(chan string),
@@ -95,6 +99,39 @@ func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*plu
 		devicePath: devicePath,
 	}
 	return dpi
+}
+
+// AddDevice appends a newly-bound NVIDIA GPU to the plugin's advertised pool
+// and signals ListAndWatch to send an updated frame to kubelet. Safe to call
+// from any goroutine. A second call for the same device ID is a no-op so the
+// vfio-watcher can re-emit a BDF without growing the pool.
+func (dpi *GenericDevicePlugin) AddDevice(dev *pluginapi.Device) {
+	dpi.devsMu.Lock()
+	for _, existing := range dpi.devs {
+		if existing.ID == dev.ID {
+			dpi.devsMu.Unlock()
+			return
+		}
+	}
+	dpi.devs = append(dpi.devs, dev)
+	dpi.devsMu.Unlock()
+
+	// Non-blocking: ListAndWatch will see the new dev on its next iteration
+	// even if the channel already has a pending signal.
+	select {
+	case dpi.update <- struct{}{}:
+	default:
+	}
+}
+
+// snapshotDevs returns a copy of devs taken under the read lock so callers
+// can iterate without holding the mutex while talking to kubelet.
+func (dpi *GenericDevicePlugin) snapshotDevs() []*pluginapi.Device {
+	dpi.devsMu.RLock()
+	defer dpi.devsMu.RUnlock()
+	out := make([]*pluginapi.Device, len(dpi.devs))
+	copy(out, dpi.devs)
+	return out
 }
 
 func buildEnv(envList map[string][]string) map[string]string {
@@ -311,8 +348,9 @@ func (dpi *GenericDevicePlugin) Register() error {
 // ListAndWatch lists devices and update that list according to the health status
 func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 
-	log.Printf("[%s] ListAndWatch called, sending %d devices:", dpi.deviceName, len(dpi.devs))
-	for _, dev := range dpi.devs {
+	initialDevs := dpi.snapshotDevs()
+	log.Printf("[%s] ListAndWatch called, sending %d devices:", dpi.deviceName, len(initialDevs))
+	for _, dev := range initialDevs {
 		numaNodes := "nil"
 		if dev.Topology != nil && len(dev.Topology.Nodes) > 0 {
 			numaNodes = fmt.Sprintf("%d", dev.Topology.Nodes[0].ID)
@@ -320,26 +358,35 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 		log.Printf("  Device ID=%s, Health=%s, NUMA=%s", dev.ID, dev.Health, numaNodes)
 	}
 
-	s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
+	s.Send(&pluginapi.ListAndWatchResponse{Devices: initialDevs})
 
 	for {
 		select {
 		case unhealthy := <-dpi.unhealthy:
 			log.Printf("In watch unhealthy")
+			dpi.devsMu.Lock()
 			for _, dev := range dpi.devs {
 				if unhealthy == dev.ID {
 					dev.Health = pluginapi.Unhealthy
 				}
 			}
-			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
+			dpi.devsMu.Unlock()
+			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.snapshotDevs()})
 		case healthy := <-dpi.healthy:
 			log.Printf("In watch healthy")
+			dpi.devsMu.Lock()
 			for _, dev := range dpi.devs {
 				if healthy == dev.ID {
 					dev.Health = pluginapi.Healthy
 				}
 			}
-			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
+			dpi.devsMu.Unlock()
+			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.snapshotDevs()})
+		case <-dpi.update:
+			// AddDevice signalled a new device joined the pool — re-publish.
+			snap := dpi.snapshotDevs()
+			log.Printf("[%s] device pool grew, sending %d devices to kubelet", dpi.deviceName, len(snap))
+			s.Send(&pluginapi.ListAndWatchResponse{Devices: snap})
 		case <-dpi.stop:
 			return nil
 		case <-dpi.term:
@@ -478,7 +525,7 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 
 		// Build a map of device ID to NUMA node from our device list
 		deviceToNUMA := make(map[string]int64)
-		for _, dev := range dpi.devs {
+		for _, dev := range dpi.snapshotDevs() {
 			if dev.Topology != nil && len(dev.Topology.Nodes) > 0 {
 				deviceToNUMA[dev.ID] = dev.Topology.Nodes[0].ID
 			}
@@ -637,7 +684,7 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 	}
 
 	bdfToIommu := returnBdfToIommuMap()
-	for _, dev := range dpi.devs {
+	for _, dev := range dpi.snapshotDevs() {
 		iommuID, ok := bdfToIommu[dev.ID]
 		if !ok {
 			log.Printf("%s: Unable to determine IOMMU group for device %s", method, dev.ID)

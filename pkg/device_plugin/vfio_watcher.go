@@ -35,7 +35,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -54,20 +53,26 @@ var nvidiaVfioBdfs = nvidiaVfioBdfsFunc
 // rejects sysfs control entries like "bind", "unbind", "new_id", "module".
 var pciAddressRe = regexp.MustCompile(`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`)
 
-// watchVfioBindings detects NVIDIA GPUs bound to a supported VFIO driver
-// after this process completed its initial discovery, and triggers an orderly
-// shutdown so the kubelet recreates the pod and re-runs discovery.
+// watchVfioBindings reports every NVIDIA PCI device that becomes bound to a
+// supported VFIO driver after the initial discovery, by invoking onBound for
+// each new BDF. It does not exit the process — the plugin keeps running and
+// the caller is expected to publish the new device through its live
+// ListAndWatch stream.
 //
-// This closes a startup race with nvidia-vfio-manager: createIommuDeviceMap
-// runs once in InitiateDevicePlugin, so any GPU bound to a VFIO driver
-// afterwards is invisible to kubelet — and therefore unschedulable — until
-// the plugin pod is restarted by hand or by an external watchdog.
+// Earlier versions of this watcher closed a stop channel on the first new
+// binding to trigger a container restart. That worked for the original
+// symptom but introduced a subtler bug on multi-tenant GPU nodes: kubelet
+// had to reconcile its pre-restart device set against the post-restart
+// ListAndWatch frames, and during that window in-flight pod allocations
+// could be dropped or double-handed-out — qemu then failed to open
+// /dev/vfio/<group> with EBUSY. Live incremental updates avoid the whole
+// reconciliation window.
 //
 // The watcher captures a baseline of currently-bound NVIDIA BDFs before
-// adding the fsnotify watch, then re-scans immediately after Add to close
-// the race window between baseline capture and watcher activation. A new BDF
-// after either point closes stop exactly once via a per-call sync.Once.
-func watchVfioBindings(stop chan struct{}) {
+// adding the fsnotify watch and re-scans immediately after Add to close the
+// race between baseline capture and watcher activation. Each new BDF is
+// dispatched exactly once via the baseline set.
+func watchVfioBindings(stop <-chan struct{}, onBound func(bdf string)) {
 	const method = "vfio-watcher"
 
 	watcher, err := fsnotify.NewWatcher()
@@ -76,14 +81,6 @@ func watchVfioBindings(stop chan struct{}) {
 		return
 	}
 	defer watcher.Close()
-
-	var once sync.Once
-	closeStop := func(reason string) {
-		once.Do(func() {
-			log.Printf("%s: triggering plugin restart: %s", method, reason)
-			close(stop)
-		})
-	}
 
 	baseline := nvidiaVfioBdfs()
 
@@ -97,8 +94,11 @@ func watchVfioBindings(stop chan struct{}) {
 	// Re-check after Add to close the race window between baseline capture
 	// and watcher activation.
 	if extra := newNvidiaBdfs(baseline); len(extra) > 0 {
-		closeStop("post-baseline rescan found new NVIDIA GPU(s): " + joinSorted(extra))
-		return
+		log.Printf("%s: post-baseline rescan found new NVIDIA GPU(s): %s", method, joinSorted(extra))
+		for _, bdf := range extra {
+			onBound(bdf)
+			baseline[bdf] = struct{}{}
+		}
 	}
 
 	for {
@@ -112,8 +112,10 @@ func watchVfioBindings(stop chan struct{}) {
 			if !isNewNvidiaBinding(ev, baseline) {
 				continue
 			}
-			closeStop("new NVIDIA GPU " + filepath.Base(ev.Name) + " bound to a VFIO driver")
-			return
+			bdf := filepath.Base(ev.Name)
+			log.Printf("%s: new NVIDIA GPU %s bound to a VFIO driver", method, bdf)
+			onBound(bdf)
+			baseline[bdf] = struct{}{}
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
