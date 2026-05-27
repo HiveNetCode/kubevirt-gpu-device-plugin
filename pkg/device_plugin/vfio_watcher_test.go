@@ -178,14 +178,24 @@ var _ = Describe("vfio-watcher", func() {
 			Expect(os.RemoveAll(tmpDir)).To(Succeed())
 		})
 
-		It("closes stop when a new NVIDIA BDF appears after startup", func() {
+		It("invokes the callback when a new NVIDIA BDF appears after startup", func() {
 			// Baseline captured as empty; new BDF will be created after the
 			// goroutine starts.
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return nvidiaVendorID, nil }
 
+			seen := make(chan string, 4)
 			stop := make(chan struct{})
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 
 			// Give the watcher a moment to set up its fsnotify Add.
 			time.Sleep(150 * time.Millisecond)
@@ -193,10 +203,11 @@ var _ = Describe("vfio-watcher", func() {
 			// Simulate a binding by creating a BDF entry in the watched dir.
 			Expect(os.WriteFile(filepath.Join(tmpDir, "vfio-pci", "0000:01:00.0"), nil, 0o644)).To(Succeed())
 
-			Eventually(stop, "2s").Should(BeClosed())
+			Eventually(seen, "2s").Should(Receive(Equal("0000:01:00.0")),
+				"watcher must call onNewVfioBdf so the plugin can incrementally publish the new GPU — without exiting the process")
 		})
 
-		It("closes stop on the post-baseline rescan when a binding races in", func() {
+		It("invokes the callback on the post-baseline rescan when a binding races in", func() {
 			// First call (baseline) returns empty; second call (post-Add
 			// rescan) returns a new BDF — simulating vfio-manager binding
 			// during the small window between the two reads.
@@ -209,38 +220,67 @@ var _ = Describe("vfio-watcher", func() {
 				return map[string]struct{}{"0000:01:00.0": {}}
 			}
 
+			seen := make(chan string, 4)
 			stop := make(chan struct{})
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 
-			Eventually(stop, "2s").Should(BeClosed())
+			Eventually(seen, "2s").Should(Receive(Equal("0000:01:00.0")),
+				"watcher must call onNewVfioBdf for BDFs that bound during the baseline-to-Add race window")
 		})
 
 		It("ignores Create events for sysfs control entries", func() {
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return nvidiaVendorID, nil }
 
+			seen := make(chan string, 4)
 			stop := make(chan struct{})
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 			time.Sleep(150 * time.Millisecond)
 
 			Expect(os.WriteFile(filepath.Join(tmpDir, "vfio-pci", "bind"), nil, 0o644)).To(Succeed())
 
-			Consistently(stop, "300ms").ShouldNot(BeClosed())
-			close(stop) // unblock the goroutine
+			Consistently(seen, "300ms").ShouldNot(Receive())
 		})
 
 		It("ignores Create events for non-NVIDIA vendor devices", func() {
 			nvidiaVfioBdfs = func() map[string]struct{} { return map[string]struct{}{} }
 			readIDFromFile = func(_, _, _ string) (string, error) { return "8086", nil }
 
+			seen := make(chan string, 4)
 			stop := make(chan struct{})
-			go watchVfioBindings(stop)
+			done := make(chan struct{})
+			go func() {
+				watchVfioBindings(stop, func(bdf string) { seen <- bdf })
+				close(done)
+			}()
+			defer func() {
+				close(stop)
+				Eventually(done, "2s").Should(BeClosed(),
+					"watcher goroutine must exit before the next test mutates package globals")
+			}()
 			time.Sleep(150 * time.Millisecond)
 
 			Expect(os.WriteFile(filepath.Join(tmpDir, "vfio-pci", "0000:01:00.0"), nil, 0o644)).To(Succeed())
 
-			Consistently(stop, "300ms").ShouldNot(BeClosed())
-			close(stop)
+			Consistently(seen, "300ms").ShouldNot(Receive())
 		})
 
 		It("exits cleanly when no supported VFIO driver dirs exist", func() {
@@ -250,7 +290,7 @@ var _ = Describe("vfio-watcher", func() {
 			stop := make(chan struct{})
 			done := make(chan struct{})
 			go func() {
-				watchVfioBindings(stop)
+				watchVfioBindings(stop, func(string) {})
 				close(done)
 			}()
 

@@ -2,16 +2,6 @@ name: Build Hive Image
 
 on:
   workflow_dispatch:
-    inputs:
-      env_name:
-        description: 'Target environment for image tag'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - staging
-          - production
 
 env:
   DOCKER_IMAGE: ${{ vars.DOCKER_REGISTRY }}/hive-compute-infra/kubevirt-gpu-device-plugin
@@ -19,7 +9,10 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.env_name || 'dev' }}
+    # Single GitHub Environment holds the OVH registry credentials. The
+    # same image artefact is promoted across dev/staging/production via
+    # GitOps tag bumps, so no per-environment image variants exist.
+    environment: dev
     name: Build kubevirt-gpu-device-plugin
     steps:
       - name: Checkout
@@ -33,11 +26,13 @@ jobs:
       - name: Compute image tag
         id: tag
         run: |
-          ENV_NAME="${{ github.event.inputs.env_name || 'dev' }}"
           UPSTREAM_VERSION=$(awk -F'= ' '/^VERSION/ {print $2}' versions.mk | tr -d ' ')
           SHORT_SHA="${GITHUB_SHA:0:8}"
-          IMAGE_TAG="${ENV_NAME}-${UPSTREAM_VERSION}-hive-${SHORT_SHA}-${TIMESTAMP}"
-          LATEST_TAG="${ENV_NAME}-latest"
+          # Single canonical tag, promoted across environments unchanged.
+          # Shape: <upstream-version>-hive-<short-sha>-<timestamp>
+          # e.g.  v1.5.0-hive-15c40906-20260518163126
+          IMAGE_TAG="${UPSTREAM_VERSION}-hive-${SHORT_SHA}-${TIMESTAMP}"
+          LATEST_TAG="hive-latest"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
           echo "LATEST_TAG=${LATEST_TAG}" >> $GITHUB_ENV
           echo "Computed image tag: ${IMAGE_TAG}"
