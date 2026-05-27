@@ -112,6 +112,8 @@ var _ = Describe("incremental late-binding discovery", func() {
 					return nvidiaVendorID, nil
 				case "device":
 					return "2684", nil
+				case "class":
+					return "030000", nil
 				}
 				return "", nil
 			}
