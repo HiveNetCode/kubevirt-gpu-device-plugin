@@ -137,21 +137,18 @@ func createDevicePlugins() {
 	for k, gpuDevices := range deviceMapSnapshot {
 		devs = nil
 		for _, gpuDev := range gpuDevices {
-			// Mark devices whose /dev/vfio/<group> is currently held by
-			// another process as Unhealthy. Including them in the pool
-			// preserves the kubelet's capacity accounting and the existing
-			// allocations of running pods that already hold them; the
-			// Unhealthy flag keeps the kubelet from handing the same PCI
-			// ID to a new pod, which would otherwise fail with
-			// "Could not open '/dev/vfio/<group>': Device or resource busy".
-			health := pluginapi.Healthy
-			if iommuGroup, ok := bdfToIommuMap[gpuDev.addr]; ok && isVfioGroupBusy(iommuGroup) {
-				health = pluginapi.Unhealthy
-				log.Printf("Marking %s Unhealthy: /dev/vfio/%s is held by another process (already in use)", gpuDev.addr, iommuGroup)
-			}
+			// Always advertise every GPU bound to vfio-pci as Healthy so the
+			// node's nvidia.com/<model> capacity reflects the physical
+			// hardware (e.g. 8 on an 8x card host). The platform-api computes
+			// "available" as `allocatable - sum(GPUs of running instances)`,
+			// so shrinking allocatable when devices are in passthrough causes
+			// a double-subtraction and the location reports negative free
+			// GPUs. The "currently in use" check is enforced in Allocate()
+			// and GetPreferredAllocation() instead, where it can swap a busy
+			// PCI ID for a free one without ever lying about capacity.
 			device := &pluginapi.Device{
 				ID:     gpuDev.addr,
-				Health: health,
+				Health: pluginapi.Healthy,
 				Topology: &pluginapi.TopologyInfo{
 					Nodes: []*pluginapi.NUMANode{
 						{ID: gpuDev.numaNode},
