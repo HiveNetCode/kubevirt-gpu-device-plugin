@@ -420,7 +420,24 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 		seenDeviceSpecs := make(map[string]struct{})
 		returnedMap := returnIommuMap()
 		bdfToIommu := returnBdfToIommuMap()
-		for _, bdf := range req.DevicesIDs {
+		// Substitute any requested PCI ID whose /dev/vfio/<group> is currently
+		// held by another process with a free device from the same pool. This
+		// covers the case where the plugin restarts while tenant VMs are
+		// passthrough'd and kubelet's checkpoint drifts: kubelet may then ask
+		// for a PCI ID that is actually in use, which would otherwise produce
+		// the "Could not open '/dev/vfio/<group>': Device or resource busy"
+		// qemu crashloop. The swap is silent from kubelet's perspective —
+		// the response carries DeviceSpecs for the substituted ID instead.
+		allocatedIDs := req.DevicesIDs
+		swapped, err := substituteBusyDevices(dpi.snapshotDevs(), allocatedIDs, bdfToIommu)
+		if err != nil {
+			return nil, fmt.Errorf("[%s] Allocate: %w", dpi.deviceName, err)
+		}
+		if !slices.Equal(swapped, allocatedIDs) {
+			log.Printf("[%s] Allocate: substituted busy devices %v -> %v", dpi.deviceName, allocatedIDs, swapped)
+			allocatedIDs = swapped
+		}
+		for _, bdf := range allocatedIDs {
 			iommuId, ok := bdfToIommu[bdf]
 			if !ok {
 				return nil, fmt.Errorf("invalid allocation request: unknown device: %s", bdf)
@@ -470,7 +487,7 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 			}
 			envList[key] = append(envList[key], devAddrs...)
 		}
-		egmPaths := egmPathsForAllocatedGPUs(req.DevicesIDs, egmDevices)
+		egmPaths := egmPathsForAllocatedGPUs(allocatedIDs, egmDevices)
 		for _, egmPath := range egmPaths {
 			appendDeviceSpec(&deviceSpecs, seenDeviceSpecs, egmPath)
 		}
@@ -519,9 +536,17 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 
 	response := &pluginapi.PreferredAllocationResponse{}
 
+	bdfToIommu := returnBdfToIommuMap()
 	for idx, req := range in.ContainerRequests {
 		log.Printf("[%s] Container request %d: Available devices=%v, MustInclude=%v, AllocationSize=%d",
 			dpi.deviceName, idx, req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, req.AllocationSize)
+
+		// Bias the available pool so currently-free vfio groups are picked
+		// first. Busy IDs stay in the pool (kubelet may still need them to
+		// satisfy MustInclude or to fill the allocation when no free
+		// substitute exists) but get the back of the queue so the NUMA
+		// pass below preferentially packs around the genuinely-free ones.
+		req.AvailableDeviceIDs = filterPreferredFreeDevices(req.AvailableDeviceIDs, bdfToIommu)
 
 		// Build a map of device ID to NUMA node from our device list
 		deviceToNUMA := make(map[string]int64)
