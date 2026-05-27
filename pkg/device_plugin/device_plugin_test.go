@@ -84,16 +84,22 @@ func getFakeIDFromFileDevicePlugin(basePath string, deviceAddress string, link s
 			return nvVendorID, nil
 		} else if link == "device" {
 			return deviceName, nil
+		} else if link == "class" {
+			return "030000", nil
 		}
 	} else if deviceAddress == deviceAddress2 {
 		if link == "vendor" {
 			return nvVendorID, nil
 		} else if link == "device" {
 			return deviceName1, nil
+		} else if link == "class" {
+			return "030200", nil
 		}
 	} else if deviceAddress == deviceAddress3 {
 		if link == "vendor" {
 			return nvVendorID, nil
+		} else if link == "class" {
+			return "030000", nil
 		}
 	}
 	return "", errors.New("Incorrect operation")

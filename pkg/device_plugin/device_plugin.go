@@ -255,9 +255,29 @@ type vfioDeviceInfo struct {
 	gpu        NvidiaGpuDevice
 }
 
+// pciDisplayClassPrefix matches the high byte of a PCI class code that
+// identifies a display controller (VGA / 3D / display-other). Sysfs reports
+// the full 24-bit class as a 6-char hex string (after readIDFromFile strips
+// the leading "0x"), so checking the first two chars is enough.
+//
+// Consumer NVIDIA GPUs are multi-function PCI devices: function 0 is the
+// display controller (class 03xxxx) and function 1 is the HDA audio
+// companion (class 040300). Both functions sit in the same IOMMU group, so
+// when nvidia-vfio-manager binds the group both functions appear under
+// /sys/bus/pci/drivers/vfio-pci. Advertising the audio companion as a
+// separate "GPU" resource (named by the hex device ID, e.g.
+// nvidia.com/22e8 next to nvidia.com/GB202_GEFORCE_RTX_5090) confuses
+// downstream consumers — KubeVirt's permittedHostDevices allow-list
+// rejects it, and the Hive instances-operator's alphabetic sort picks
+// the wrong name.
+const pciDisplayClassPrefix = "03"
+
 // inspectVfioPciDevice reads the sysfs entries for a single PCI BDF and
 // returns the resolved vfioDeviceInfo, or (nil, false) if the device is not
-// an NVIDIA GPU bound to a supported VFIO driver. Pure read; no map mutation.
+// an NVIDIA display controller bound to a supported VFIO driver. Audio /
+// USB / serial companion functions on the same multi-function card are
+// skipped — they are passed through automatically with the GPU via the
+// shared IOMMU group at allocation time. Pure read; no map mutation.
 func inspectVfioPciDevice(bdf string) (*vfioDeviceInfo, bool) {
 	vendorID, err := readIDFromFile(basePath, bdf, "vendor")
 	if err != nil || vendorID != nvidiaVendorID {
@@ -269,6 +289,17 @@ func inspectVfioPciDevice(bdf string) (*vfioDeviceInfo, bool) {
 		return nil, false
 	}
 	if !isSupportedVfioDriver(driver) {
+		return nil, false
+	}
+	class, err := readIDFromFile(basePath, bdf, "class")
+	if err != nil {
+		log.Printf("inspectVfioPciDevice %s: read class: %v", bdf, err)
+		return nil, false
+	}
+	if !strings.HasPrefix(class, pciDisplayClassPrefix) {
+		// Non-display function on a multi-function NVIDIA card (audio
+		// companion, USB-C controller, serial bus). Implicit in the
+		// IOMMU group of the lead GPU; do not advertise separately.
 		return nil, false
 	}
 	iommuGroup, err := readLink(basePath, bdf, "iommu_group")
