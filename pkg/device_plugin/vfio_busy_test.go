@@ -144,7 +144,7 @@ var _ = Describe("vfio-busy", func() {
 		})
 	})
 
-	Describe("substituteBusyDevices", func() {
+	Describe("substituteUnusableDevices", func() {
 		var (
 			origIsBusy func(string) bool
 			pool       []*pluginapi.Device
@@ -173,7 +173,7 @@ var _ = Describe("vfio-busy", func() {
 
 		It("returns requested IDs unchanged when none are busy", func() {
 			isVfioGroupBusy = func(string) bool { return false }
-			out, err := substituteBusyDevices(pool, []string{"0000:23:00.0", "0000:24:00.0"}, bdfToIommu)
+			out, err := substituteUnusableDevices(pool, []string{"0000:23:00.0", "0000:24:00.0"}, bdfToIommu)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(out).To(Equal([]string{"0000:23:00.0", "0000:24:00.0"}))
 		})
@@ -181,7 +181,7 @@ var _ = Describe("vfio-busy", func() {
 		It("substitutes a busy device with a free one from the pool", func() {
 			// Only group 51 (BDF 0000:23:00.0) is busy.
 			isVfioGroupBusy = func(g string) bool { return g == "51" }
-			out, err := substituteBusyDevices(pool, []string{"0000:23:00.0"}, bdfToIommu)
+			out, err := substituteUnusableDevices(pool, []string{"0000:23:00.0"}, bdfToIommu)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(out).To(HaveLen(1))
 			Expect(out[0]).ToNot(Equal("0000:23:00.0"), "the busy ID must be replaced")
@@ -193,16 +193,16 @@ var _ = Describe("vfio-busy", func() {
 			// kubelet asked for two devices. We must surface an error rather
 			// than return a duplicate (which would crash qemu later).
 			isVfioGroupBusy = func(g string) bool { return g == "51" || g == "95" }
-			_, err := substituteBusyDevices(pool, []string{"0000:23:00.0", "0000:25:00.0"}, bdfToIommu)
+			_, err := substituteUnusableDevices(pool, []string{"0000:23:00.0", "0000:25:00.0"}, bdfToIommu)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("no free VFIO group available"))
+			Expect(err.Error()).To(ContainSubstring("no usable VFIO device available"))
 		})
 
 		It("keeps healthy + swap combinations consistent (free ID retained, busy ID swapped)", func() {
 			// 51 busy, 73 free, 95 free. kubelet asks for [23 (busy), 24 (free)].
 			// Expect: [<swap of 23 → some free other than 24>, 24]
 			isVfioGroupBusy = func(g string) bool { return g == "51" }
-			out, err := substituteBusyDevices(pool, []string{"0000:23:00.0", "0000:24:00.0"}, bdfToIommu)
+			out, err := substituteUnusableDevices(pool, []string{"0000:23:00.0", "0000:24:00.0"}, bdfToIommu)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(out).To(HaveLen(2))
 			Expect(out[1]).To(Equal("0000:24:00.0"), "a free requested ID must not be touched")
@@ -210,7 +210,7 @@ var _ = Describe("vfio-busy", func() {
 		})
 	})
 
-	Describe("filterPreferredFreeDevices", func() {
+	Describe("filterPreferredUsableDevices", func() {
 		var origIsBusy func(string) bool
 
 		BeforeEach(func() { origIsBusy = isVfioGroupBusy })
@@ -220,13 +220,13 @@ var _ = Describe("vfio-busy", func() {
 			isVfioGroupBusy = func(string) bool { return false }
 			in := []string{"a", "b", "c"}
 			bdfToIommu := map[string]string{"a": "1", "b": "2", "c": "3"}
-			Expect(filterPreferredFreeDevices(in, bdfToIommu)).To(Equal(in))
+			Expect(filterPreferredUsableDevices(in, bdfToIommu)).To(Equal(in))
 		})
 
 		It("moves busy devices to the end so kubelet picks free ones first", func() {
 			isVfioGroupBusy = func(g string) bool { return g == "1" || g == "3" }
 			bdfToIommu := map[string]string{"a": "1", "b": "2", "c": "3", "d": "4"}
-			out := filterPreferredFreeDevices([]string{"a", "b", "c", "d"}, bdfToIommu)
+			out := filterPreferredUsableDevices([]string{"a", "b", "c", "d"}, bdfToIommu)
 			Expect(out).To(Equal([]string{"b", "d", "a", "c"}))
 		})
 	})
