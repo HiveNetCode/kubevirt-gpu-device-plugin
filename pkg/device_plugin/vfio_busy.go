@@ -73,26 +73,32 @@ func isVfioGroupBusyFunc(group string) bool {
 	return false
 }
 
-// substituteBusyDevices returns a copy of requested where every PCI ID
-// whose IOMMU group is currently held by another process has been swapped
-// for a free device from pool. The returned slice preserves ordering and
-// is guaranteed not to contain duplicates.
+// isDeviceUnusable reports whether the GPU at bdf must not be handed to a
+// new VM: its VFIO group is currently held by another process (busy), or
+// its BAR1 is unassigned (broken, see hasAssignedBAR1).
+func isDeviceUnusable(bdf, iommu string) bool {
+	return isVfioGroupBusy(iommu) || !hasAssignedBAR1(bdf)
+}
+
+// substituteUnusableDevices returns a copy of requested where every PCI ID
+// that is busy or broken has been swapped for a usable device from pool.
+// The returned slice preserves ordering and is guaranteed not to contain
+// duplicates.
 //
-// Returns an error if a busy device cannot be replaced because the pool
-// has no candidate whose IOMMU group is free (and that is not already
-// part of the response). Callers should surface the error to kubelet so
-// the request is retried rather than producing a guaranteed-failing
-// allocation.
-func substituteBusyDevices(pool []*pluginapi.Device, requested []string, bdfToIommu map[string]string) ([]string, error) {
-	// Two passes so a free requested ID later in the slice is not stolen
-	// by the substitute step for an earlier busy one. First pass reserves
-	// every requested ID we will keep (unknown or non-busy); second pass
-	// picks substitutes from the remainder.
+// Returns an error if an unusable device cannot be replaced because the
+// pool has no usable candidate (that is not already part of the response).
+// Callers should surface the error to kubelet so the request is retried
+// rather than producing a guaranteed-failing allocation.
+func substituteUnusableDevices(pool []*pluginapi.Device, requested []string, bdfToIommu map[string]string) ([]string, error) {
+	// Two passes so a usable requested ID later in the slice is not stolen
+	// by the substitute step for an earlier unusable one. First pass
+	// reserves every requested ID we will keep (unknown or usable); second
+	// pass picks substitutes from the remainder.
 	keep := make([]bool, len(requested))
 	used := make(map[string]bool, len(requested))
 	for i, bdf := range requested {
 		iommu, ok := bdfToIommu[bdf]
-		if !ok || !isVfioGroupBusy(iommu) {
+		if !ok || !isDeviceUnusable(bdf, iommu) {
 			keep[i] = true
 			used[bdf] = true
 		}
@@ -104,9 +110,9 @@ func substituteBusyDevices(pool []*pluginapi.Device, requested []string, bdfToIo
 			out[i] = bdf
 			continue
 		}
-		sub, err := pickFreeSubstitute(pool, used, bdfToIommu)
+		sub, err := pickUsableSubstitute(pool, used, bdfToIommu)
 		if err != nil {
-			return nil, fmt.Errorf("cannot substitute busy device %s (iommu %s): %w", bdf, bdfToIommu[bdf], err)
+			return nil, fmt.Errorf("cannot substitute busy or broken device %s (iommu %s): %w", bdf, bdfToIommu[bdf], err)
 		}
 		out[i] = sub
 		used[sub] = true
@@ -114,10 +120,10 @@ func substituteBusyDevices(pool []*pluginapi.Device, requested []string, bdfToIo
 	return out, nil
 }
 
-// pickFreeSubstitute returns the first device in pool whose IOMMU group is
-// not currently held and that is not already in used. Returns an error if
-// no candidate is available.
-func pickFreeSubstitute(pool []*pluginapi.Device, used map[string]bool, bdfToIommu map[string]string) (string, error) {
+// pickUsableSubstitute returns the first device in pool that is neither
+// busy nor broken and that is not already in used. Returns an error if no
+// candidate is available.
+func pickUsableSubstitute(pool []*pluginapi.Device, used map[string]bool, bdfToIommu map[string]string) (string, error) {
 	for _, d := range pool {
 		if used[d.ID] {
 			continue
@@ -126,39 +132,39 @@ func pickFreeSubstitute(pool []*pluginapi.Device, used map[string]bool, bdfToIom
 		if !ok {
 			continue
 		}
-		if isVfioGroupBusy(iommu) {
+		if isDeviceUnusable(d.ID, iommu) {
 			continue
 		}
 		return d.ID, nil
 	}
-	return "", errors.New("no free VFIO group available in the pool")
+	return "", errors.New("no usable VFIO device available in the pool")
 }
 
-// filterPreferredFreeDevices returns available with busy devices moved to
-// the end of the slice so kubelet's preferred-allocation pass picks free
-// ones first when the available set is larger than the requested count.
-// Returns the input slice when no busy devices are present, so the caller
-// can detect the no-op case without an allocation.
-func filterPreferredFreeDevices(available []string, bdfToIommu map[string]string) []string {
-	hasBusy := false
+// filterPreferredUsableDevices returns available with busy or broken
+// devices moved to the end of the slice so kubelet's preferred-allocation
+// pass picks usable ones first when the available set is larger than the
+// requested count. Returns the input slice when every device is usable, so
+// the caller can detect the no-op case without an allocation.
+func filterPreferredUsableDevices(available []string, bdfToIommu map[string]string) []string {
+	hasUnusable := false
 	for _, id := range available {
-		if iommu, ok := bdfToIommu[id]; ok && isVfioGroupBusy(iommu) {
-			hasBusy = true
+		if iommu, ok := bdfToIommu[id]; ok && isDeviceUnusable(id, iommu) {
+			hasUnusable = true
 			break
 		}
 	}
-	if !hasBusy {
+	if !hasUnusable {
 		return available
 	}
-	free := make([]string, 0, len(available))
-	busy := make([]string, 0)
+	usable := make([]string, 0, len(available))
+	unusable := make([]string, 0)
 	for _, id := range available {
 		iommu, ok := bdfToIommu[id]
-		if ok && isVfioGroupBusy(iommu) {
-			busy = append(busy, id)
+		if ok && isDeviceUnusable(id, iommu) {
+			unusable = append(unusable, id)
 		} else {
-			free = append(free, id)
+			usable = append(usable, id)
 		}
 	}
-	return slices.Concat(free, busy)
+	return slices.Concat(usable, unusable)
 }

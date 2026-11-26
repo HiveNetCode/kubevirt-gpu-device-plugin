@@ -76,8 +76,10 @@ type GenericDevicePlugin struct {
 	update     chan struct{}
 	server     *grpc.Server
 	socketPath string
-	stop       chan struct{} // this channel signals to stop the DP
-	term       chan bool     // this channel detects kubelet restarts
+	stop       chan struct{}   // this channel signals to stop the DP
+	term       chan bool       // this channel detects kubelet restarts
+	healthStop chan struct{}   // closed by Stop(); ends this start's barHealthCheck, which dpi.stop outlives (restart() reuses the dpi with a fresh stop channel)
+	barBroken  map[string]bool // the BAR checker's last verdict per device; owned by its goroutine (see pushBarHealthTransitions)
 	healthy    chan string
 	unhealthy  chan string
 	devicePath string
@@ -97,6 +99,7 @@ func NewGenericDevicePlugin(deviceName string, devicePath string, devices []*plu
 		unhealthy:  make(chan string),
 		deviceName: deviceName,
 		devicePath: devicePath,
+		barBroken:  make(map[string]bool),
 	}
 	return dpi
 }
@@ -285,7 +288,12 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 		return err
 	}
 
+	// Assigned before the healthCheck goroutine starts: that goroutine is
+	// the one that calls restart() → Stop(), and Stop() closing healthStop
+	// needs a happens-before edge on this write to see the current channel.
+	dpi.healthStop = make(chan struct{})
 	go dpi.healthCheck()
+	go dpi.barHealthCheck(dpi.healthStop, barHealthRecheckInterval)
 
 	log.Println(dpi.deviceName + " Device plugin server ready")
 
@@ -300,6 +308,11 @@ func (dpi *GenericDevicePlugin) Stop() error {
 
 	// Send terminate signal to ListAndWatch()
 	dpi.term <- true
+
+	if dpi.healthStop != nil {
+		close(dpi.healthStop)
+		dpi.healthStop = nil
+	}
 
 	dpi.server.Stop()
 	dpi.server = nil
@@ -420,21 +433,25 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 		seenDeviceSpecs := make(map[string]struct{})
 		returnedMap := returnIommuMap()
 		bdfToIommu := returnBdfToIommuMap()
-		// Substitute any requested PCI ID whose /dev/vfio/<group> is currently
-		// held by another process with a free device from the same pool. This
-		// covers the case where the plugin restarts while tenant VMs are
-		// passthrough'd and kubelet's checkpoint drifts: kubelet may then ask
-		// for a PCI ID that is actually in use, which would otherwise produce
-		// the "Could not open '/dev/vfio/<group>': Device or resource busy"
-		// qemu crashloop. The swap is silent from kubelet's perspective —
-		// the response carries DeviceSpecs for the substituted ID instead.
+		// Substitute any requested PCI ID that is unusable — its
+		// /dev/vfio/<group> is currently held by another process, or its
+		// BAR1 is unassigned — with a usable device from the same pool. The
+		// busy case covers the plugin restarting while tenant VMs are
+		// passthrough'd and kubelet's checkpoint drifting: kubelet may then
+		// ask for a PCI ID that is actually in use, which would otherwise
+		// produce the "Could not open '/dev/vfio/<group>': Device or
+		// resource busy" qemu crashloop. The broken case covers the same
+		// checkpoint drift pointing at a GPU this plugin advertises as
+		// Unhealthy: kubelet does not re-consult health when replaying a
+		// checkpoint. The swap is silent from kubelet's perspective — the
+		// response carries DeviceSpecs for the substituted ID instead.
 		allocatedIDs := req.DevicesIDs
-		swapped, err := substituteBusyDevices(dpi.snapshotDevs(), allocatedIDs, bdfToIommu)
+		swapped, err := substituteUnusableDevices(dpi.snapshotDevs(), allocatedIDs, bdfToIommu)
 		if err != nil {
 			return nil, fmt.Errorf("[%s] Allocate: %w", dpi.deviceName, err)
 		}
 		if !slices.Equal(swapped, allocatedIDs) {
-			log.Printf("[%s] Allocate: substituted busy devices %v -> %v", dpi.deviceName, allocatedIDs, swapped)
+			log.Printf("[%s] Allocate: substituted busy or broken devices %v -> %v", dpi.deviceName, allocatedIDs, swapped)
 			allocatedIDs = swapped
 		}
 		for _, bdf := range allocatedIDs {
@@ -541,12 +558,13 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 		log.Printf("[%s] Container request %d: Available devices=%v, MustInclude=%v, AllocationSize=%d",
 			dpi.deviceName, idx, req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, req.AllocationSize)
 
-		// Bias the available pool so currently-free vfio groups are picked
-		// first. Busy IDs stay in the pool (kubelet may still need them to
-		// satisfy MustInclude or to fill the allocation when no free
-		// substitute exists) but get the back of the queue so the NUMA
-		// pass below preferentially packs around the genuinely-free ones.
-		req.AvailableDeviceIDs = filterPreferredFreeDevices(req.AvailableDeviceIDs, bdfToIommu)
+		// Bias the available pool so usable devices — free vfio group and
+		// an assigned BAR1 — are picked first. Busy or broken IDs stay in
+		// the pool (kubelet may still need them to satisfy MustInclude or
+		// to fill the allocation when no substitute exists) but get the
+		// back of the queue so the NUMA pass below preferentially packs
+		// around the genuinely-usable ones.
+		req.AvailableDeviceIDs = filterPreferredUsableDevices(req.AvailableDeviceIDs, bdfToIommu)
 
 		// Build a map of device ID to NUMA node from our device list
 		deviceToNUMA := make(map[string]int64)

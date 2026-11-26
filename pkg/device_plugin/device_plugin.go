@@ -118,14 +118,18 @@ func createDevicePlugins() {
 	var devicePlugins []*GenericDevicePlugin
 	var vGpuDevicePlugins []*GenericVGpuDevicePlugin
 	var devs []*pluginapi.Device
-	// Snapshot deviceMap under the read lock so concurrent additions from
-	// the vfio-watcher do not race with this initial iteration.
+	// Snapshot deviceMap and bdfToIommuMap under the read lock so concurrent
+	// additions from the vfio-watcher do not race with this initial iteration.
 	mapsMu.RLock()
 	deviceMapSnapshot := make(map[string][]NvidiaGpuDevice, len(deviceMap))
 	for k, v := range deviceMap {
 		cp := make([]NvidiaGpuDevice, len(v))
 		copy(cp, v)
 		deviceMapSnapshot[k] = cp
+	}
+	bdfToIommuSnapshot := make(map[string]string, len(bdfToIommuMap))
+	for k, v := range bdfToIommuMap {
+		bdfToIommuSnapshot[k] = v
 	}
 	log.Printf("Iommu Map %v", iommuMap)
 	log.Printf("Device Map %v", deviceMap)
@@ -137,18 +141,31 @@ func createDevicePlugins() {
 	for k, gpuDevices := range deviceMapSnapshot {
 		devs = nil
 		for _, gpuDev := range gpuDevices {
-			// Always advertise every GPU bound to vfio-pci as Healthy so the
-			// node's nvidia.com/<model> capacity reflects the physical
-			// hardware (e.g. 8 on an 8x card host). The platform-api computes
+			// A GPU bound to vfio-pci is advertised Healthy even while it is
+			// passed through to a running VM, so the node's
+			// nvidia.com/<model> capacity reflects the physical hardware
+			// (e.g. 8 on an 8x card host). The platform-api computes
 			// "available" as `allocatable - sum(GPUs of running instances)`,
 			// so shrinking allocatable when devices are in passthrough causes
 			// a double-subtraction and the location reports negative free
 			// GPUs. The "currently in use" check is enforced in Allocate()
 			// and GetPreferredAllocation() instead, where it can swap a busy
 			// PCI ID for a free one without ever lying about capacity.
+			//
+			// A free GPU whose BAR1 the kernel could not assign is different:
+			// it is not occupied but broken — a guest driver cannot map its
+			// VRAM aperture — so it is advertised Unhealthy, genuinely
+			// shrinking allocatable, and Allocate() refuses to substitute it
+			// in. A broken GPU a VM still holds stays Healthy to avoid the
+			// double-subtraction above; the periodic BAR checker flips it
+			// once released. See advertisedHealth.
+			health := advertisedHealth(gpuDev.addr, bdfToIommuSnapshot[gpuDev.addr])
+			if health != pluginapi.Healthy {
+				log.Printf("createDevicePlugins %s: BAR1 is unassigned — advertising Unhealthy", gpuDev.addr)
+			}
 			device := &pluginapi.Device{
 				ID:     gpuDev.addr,
-				Health: pluginapi.Healthy,
+				Health: health,
 				Topology: &pluginapi.TopologyInfo{
 					Nodes: []*pluginapi.NUMANode{
 						{ID: gpuDev.numaNode},
@@ -389,9 +406,13 @@ func onLateVfioBinding(bdf string) {
 		log.Printf("onLateVfioBinding %s: no live plugin for device id %s yet — will be advertised on next daemon restart", bdf, info.deviceID)
 		return
 	}
+	health := advertisedHealth(info.gpu.addr, info.iommuGroup)
+	if health != pluginapi.Healthy {
+		log.Printf("onLateVfioBinding %s: BAR1 is unassigned — advertising Unhealthy", info.gpu.addr)
+	}
 	dp.AddDevice(&pluginapi.Device{
 		ID:     info.gpu.addr,
-		Health: pluginapi.Healthy,
+		Health: health,
 		Topology: &pluginapi.TopologyInfo{
 			Nodes: []*pluginapi.NUMANode{{ID: info.gpu.numaNode}},
 		},
