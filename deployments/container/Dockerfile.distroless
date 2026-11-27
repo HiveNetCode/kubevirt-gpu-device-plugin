@@ -60,7 +60,7 @@ COPY . .
 RUN CGO_ENABLED=1 \
     go build -trimpath -o nvidia-kubevirt-gpu-device-plugin ./cmd
 
-FROM nvcr.io/nvidia/distroless/go:v4.0.8
+FROM nvcr.io/nvidia/distroless/go:v4.2.3@sha256:537925be7885b4681ac627aaa7adfa9fe722e694be98b6e6abd94984b9c0c49e
 
 ARG VERSION
 
