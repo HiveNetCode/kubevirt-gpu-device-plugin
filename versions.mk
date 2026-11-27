@@ -18,6 +18,6 @@ REGISTRY ?= nvcr.io/nvidia
 
 VERSION ?= v1.5.0
 
-GOLANG_VERSION ?= 1.26.10
+GOLANG_VERSION ?= 1.26.11
 
 GIT_COMMIT ?= $(shell git describe --match="" --dirty --long --always --abbrev=40 2> /dev/null || echo "")
